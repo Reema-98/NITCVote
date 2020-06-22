@@ -1,45 +1,48 @@
-pragma solidity >=0.4.26;
+pragma solidity ^0.5.16;
+
+
 pragma experimental ABIEncoderV2; // needed to be able to pass string arrays and structs into functions
 
-contract ElectionFactory {
-    address public factoryManager;
-    address public registrationAuthority;
-    address[] public deployedElections;
+/// @dev use this to register and unregister voters
+contract RegistrationAuthority {
 
-    /// @dev initializes the contract and sets the contract manager to be the deployer of the contract
-    constructor(address _registrationAuthority) public {
-        factoryManager = msg.sender;
-        registrationAuthority = _registrationAuthority;
+    address public registrationAuthority;
+
+    address[] public deployedElections; // keeps a list of all deployed elections
+
+    /// @dev initializes the contract and sets the contract registration authority to be the deployer of the contract
+    constructor() public {
+        registrationAuthority = msg.sender;
     }
 
-    /// @dev only the factory manager is allowed functions marked with this
+    /// @dev only the registration authority is allowed functions marked with this
     /// @notice functions with this modifier can only be used by the administrator
     modifier restricted() {
-        require(msg.sender == factoryManager, "only the factory manager is allowed to use this function");
+        require(msg.sender == registrationAuthority, "only the registration authority is allowed to use this function");
         _;
     }
 
+    /*****Election related function******/
     /// @dev use this to deploy new Election contracts and reset the temporary options lists afterwards
     /// @param _title specifies the name of the election (e.g. national elections)
     /// @param _description specifies the description of the election
     /// @param _startTime specifies the beginning of the election (since Unix Epoch in seconds)
-    /// @param _timeLimit specifies a time limit until when the election is open (since Unix Epoch in seconds)
+    /// @param _endTime specifies a time limit until when the election is open (since Unix Epoch in seconds)
     function createElection(
         string memory _title,
         string memory _description,
         uint _startTime,
-        uint _timeLimit,
+        uint _endTime,
         string memory _encryptionKey)
         public restricted {
         deployedElections.push(
             address(
                 new Election(
-                    factoryManager,
                     registrationAuthority,
                     _title,
                     _description,
                     _startTime,
-                    _timeLimit,
+                    _endTime,
                     _encryptionKey
                 )
             )
@@ -53,104 +56,144 @@ contract ElectionFactory {
     }
 }
 
-/// @title Election
-/// @author Johannes Mols (02.09.2019)
 /// @dev This is the actual election contract where users can vote
-/// @dev Security by design: homomorphic encryption, (zero-knowledge proofs), allowing voters to vote multiple times to avoid coercion (new vote invalidates old one)
+/// @dev Security by design: secret sharing, allows voters one time voting
 contract Election {
-    struct Option {
-        string title;
-        string description;
+
+    struct Voter {
+        uint listPointer;
+        bool isVoter;
+        address ethAddress;
     }
 
-    struct Vote {
-        uint listPointer; // index in the list of addresses that voted
-        string encryptedVote; // homomorphically encrypted 0 or 1 for each option. 1 being a vote. Max 1 per voter.
+    mapping(address => Voter) private votersList;
+    address[] private votersReferenceList;
+
+    /*****Voter related function******/
+    /// @dev use this to register or update a voter
+    function registerVoter(address _voter) external restricted beforeElection {
+
+        //ONLY ONE TIME ADDRESS REGISTRATION POSSIBLE PER ELECTION
+        votersList[_voter].listPointer = votersReferenceList.push(_voter) - 1;
+        votersList[_voter].isVoter = true;
+        votersList[_voter].ethAddress = _voter;
+
     }
 
-    address public electionFactory;
-    address public electionManager;
+    /// @dev use this to unregister a voter
+    function unregisterVoter(address _voter) external restricted beforeElection{
+        require(votersList[_voter].isVoter == true, "this address is not registered as a voter");
+
+        // Delete the desired entry by moving the last item in the array to the row to delete, and then shorten the array by one
+        votersList[_voter].isVoter = false;
+        uint rowToDelete = votersList[_voter].listPointer;
+        address keyToMove = votersReferenceList[votersReferenceList.length - 1];
+        votersReferenceList[rowToDelete] = keyToMove;
+        votersList[keyToMove].listPointer = rowToDelete;
+        votersReferenceList.length--;
+    }
+
+    /// @dev use this to check whether an address belongs to a valid voter
+    function isRegisteredVoter(address _voter) public view returns(bool) {
+        if (votersReferenceList.length == 0) return false;
+        return (votersList[_voter].isVoter);
+    }
+
+    /// @dev use this this to get the number of registered voters
+    function getNumberOfVoters() public view returns(uint) {
+        return votersReferenceList.length;
+    }
+
+    /// @dev get a list of registered voters
+    function getListOfVoters() public view returns(address[] memory x) {
+        return votersReferenceList;
+    }
+
+    /// @dev get details of a specific voter
+    function getVoterDetails(address _voter) public view returns(Voter memory) {
+        return votersList[_voter];
+    }
+
+
+    /*****Election related function******/
+    struct Ballot {
+        string name;
+        string party;
+    }
+
     address public registrationAuthority;
     string public title;
     string public description;
     uint public startTime;
-    uint public timeLimit;
-    Option[] public options;
+    uint public endTime;
+    Ballot[] public ballotList;
     string public encryptionKey;
     uint[] public publishedResult;
 
-    mapping(address => Vote) private votes; // records encrypted vote for each address
-    address[] private votesReferenceList; // keeps a list of all addresses that voted
+    mapping(address => bool) private votersCheckList; // records that the voter has voted
+    string[] private encryptedVoteList; // keeps a list of all encrypted votes
 
-    /// @dev initializes the contract with all required parameters and sets the manager of the contract
+    /// @dev initializes the contract with all required parameters
     constructor(
-        address _manager,
         address _registrationAuthority,
         string memory _title,
         string memory _description,
         uint _startTime,
-        uint _timeLimit,
+        uint _endTime,
         string memory _encryptionKey
     ) public {
-        electionFactory = msg.sender;
-        registrationAuthority = _registrationAuthority;
-        electionManager = _manager;
+        registrationAuthority=_registrationAuthority;
+        //registrationAuthorityContractAdd = msg.sender;
         title = _title;
         description = _description;
         startTime = _startTime;
-        timeLimit = _timeLimit;
+        endTime = _endTime;
         encryptionKey = _encryptionKey;
     }
 
-    /// @dev only the factory manager is allowed functions marked with this
-    /// @notice functions with this modifier can only be used by the administrator
-    modifier manager() {
-        require(msg.sender == electionManager, "only the election manager is allowed to use this function");
+    /// @dev only the registration authority is allowed functions marked with this
+    /// @notice functions with this modifier can only be used by the registration authority
+    modifier restricted() {
+        require(msg.sender == registrationAuthority, "only the registration authority is allowed to use this function");
         _;
     }
 
-    modifier factory() {
-        require(msg.sender == electionFactory, "only the election factory is allowed to use this function");
-        _;
-    }
-
+    /// @dev functions marked with this can be called before the specified start time
     modifier beforeElection() {
         require(now < startTime, "only allowed before election");
         _;
     }
 
+    /// @dev functions marked with this can be called during the specified time frame
     modifier duringElection() {
-        require(now > startTime && now < timeLimit, "only allowed during election");
+        require(now > startTime && now < endTime, "only allowed during election");
         _;
     }
 
+    /// @dev functions marked with this can be called after the specified end time
     modifier afterElection() {
-        require(now > timeLimit, "only allowed after election");
+        require(now > endTime, "only allowed after election");
         _;
     }
 
     /// @dev add an option to the ballot before the election starts
-    function addOption(string calldata _title, string calldata _description) external manager beforeElection {
-        options.push(Option({ title: _title, description: _description }));
+    function addCandidate(string calldata _name, string calldata _party) external restricted beforeElection {
+        ballotList.push(Ballot({ name: _name, party: _party }));
     }
 
     /// @dev get all available options on the ballot
-    function getOptions() external view returns(Option[] memory) {
-        return options;
+    function getBallot() external view returns(Ballot[] memory x) {
+        return ballotList;
     }
 
-    /// @dev returns a list of addresses that participated in the election
-    function getListOfAddressesThatVoted() external view afterElection returns(address[] memory voterList) {
-        return votesReferenceList;
-    }
 
-    /// @dev get the encrypted vote of a voter, only allowed after the election is over
-    function getEncryptedVoteOfVoter(address _address) external view afterElection returns(string memory encryptedVote) {
-        return votes[_address].encryptedVote;
-    }
 
+    /// @dev get the list of encrypted votes of a voter, only allowed after the election is over
+    function getencryptedVoteList() external view restricted afterElection returns(string[] memory success) {
+        return encryptedVoteList;
+    }
     /// @dev publish the decrypted version of the sum of all votes for each candidate
-    function publishResults(uint[] calldata results) external manager afterElection returns(bool success) {
+    function publishResults(uint[] calldata results) external restricted afterElection returns(bool success) {
         publishedResult = results;
         return true;
     }
@@ -164,111 +207,16 @@ contract Election {
     /// @dev allows users to vote multiple times, invalidating the previous vote
     function vote(string calldata _encryptedVote) external duringElection returns(bool success) {
         require(isRegisteredVoter(msg.sender), "message sender is not a registered voter");
-
-        votes[msg.sender].encryptedVote = _encryptedVote;
-
-        if(!hasVoted(msg.sender)) {
-            votes[msg.sender].listPointer = votesReferenceList.push(msg.sender) - 1;
-        }
+        require(!votersCheckList[msg.sender],"only one vote possible");
+        encryptedVoteList.push(_encryptedVote);
+        votersCheckList[msg.sender] = true;
 
         return true;
     }
 
     /// @dev find out whether a voter has submitted their vote
     function hasVoted(address _address) public view returns(bool) {
-        if(votesReferenceList.length == 0) return false;
-        return (votesReferenceList[votes[_address].listPointer] == _address);
+        return votersCheckList[_address];
     }
 
-    /// @dev check the registration authority whether the address is registered as a valid voter
-    function isRegisteredVoter(address _address) private view returns(bool) {
-        RegistrationAuthority ra = RegistrationAuthority(registrationAuthority);
-        return ra.isVoter(_address);
-    }
-}
-
-/// @title The Registration Authority takes care of keeping a record of eligible voters
-/// @author Johannes Mols (03.09.2019)
-/// @dev use this to register and unregister voters
-contract RegistrationAuthority {
-    struct Voter {
-        uint listPointer;
-        bool isVoter;
-        address ethAddress;
-        string name;
-        string streetAddress;
-        string birthdate;
-        string personId;
-    }
-
-    address public manager;
-
-    mapping(address => Voter) private voters;
-    address[] private votersReferenceList;
-
-    /// @dev initializes the contract and sets the contract manager to be the deployer of the contract
-    constructor() public {
-        manager = msg.sender;
-    }
-
-    /// @dev only the factory manager is allowed functions marked with this
-    /// @notice functions with this modifier can only be used by the administrator
-    modifier restricted() {
-        require(msg.sender == manager, "only the contract manager is allowed to use this function");
-        _;
-    }
-
-    /// @dev use this to register or update a voter
-    function registerOrUpdateVoter(
-        address _voter,
-        string calldata _name,
-        string calldata _streetAddress,
-        string calldata _birthdate,
-        string calldata _personId) external restricted {
-
-        if (voters[_voter].isVoter == false) {
-            voters[_voter].listPointer = votersReferenceList.push(_voter) - 1;
-            voters[_voter].isVoter = true;
-            voters[_voter].ethAddress = _voter;
-        }
-
-        voters[_voter].name = _name;
-        voters[_voter].streetAddress = _streetAddress;
-        voters[_voter].birthdate = _birthdate;
-        voters[_voter].personId = _personId;
-    }
-
-    /// @dev use this to unregister a voter
-    function unregisterVoter(address _voter) external restricted {
-        require(voters[_voter].isVoter == true, "this address is not registered as a voter");
-
-        // Delete the desired entry by moving the last item in the array to the row to delete, and then shorten the array by one
-        voters[_voter].isVoter = false;
-        uint rowToDelete = voters[_voter].listPointer;
-        address keyToMove = votersReferenceList[votersReferenceList.length - 1];
-        votersReferenceList[rowToDelete] = keyToMove;
-        voters[keyToMove].listPointer = rowToDelete;
-        votersReferenceList.length--;
-    }
-
-    /// @dev use this to check whether an address belongs to a valid voter
-    function isVoter(address _voter) public view returns(bool) {
-        if (votersReferenceList.length == 0) return false;
-        return (voters[_voter].isVoter);
-    }
-
-    /// @dev use this this to get the number of registered voters
-    function getNumberOfVoters() public view returns(uint) {
-        return votersReferenceList.length;
-    }
-
-    /// @dev get a list of registered voters
-    function getListOfVoters() public view returns(address[] memory) {
-        return votersReferenceList;
-    }
-
-    /// @dev get details of a specific voter
-    function getVoterDetails(address _voter) public view returns(Voter memory) {
-        return voters[_voter];
-    }
 }
